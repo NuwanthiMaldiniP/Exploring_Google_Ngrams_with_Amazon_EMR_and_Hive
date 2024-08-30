@@ -1,0 +1,129 @@
+# Get EMR Cluster ID and export to the Environment.
+export ID=$(aws emr list-clusters | jq '.Clusters[0].Id' | tr -d '"')
+
+# Use the ID to get the PublicDNS name of the EMR Cluster 
+# and export to the Environment.
+export HOST=$(aws emr describe-cluster --cluster-id $ID | jq '.Cluster.MasterPublicDnsName' | tr -d '"')
+
+# SSH to the EMR cluster
+ssh -i ~/EMRKey-lab.pem hadoop@$HOST
+
+
+Examine data using HiveQL
+
+--create table
+
+CREATE EXTERNAL TABLE ngrams
+(gram string, year int, occurrences bigint, pages bigint, books bigint)
+ROW FORMAT DELIMITED FIELDS TERMINATED BY '\t'
+STORED AS SEQUENCEFILE
+LOCATION 's3://datasets.elasticmapreduce/ngrams/books/20090715/eng-1M/1gram/';
+
+normalize data
+
+CREATE TABLE normalized
+(gram string, year int, occurrences bigint);
+
+Next, you will SELECT the data from the ngrams table and then INSERT it into the new normalized table. The query will:
+
+Only use data between 1990 and 2005
+Convert the n-grams to lowercase
+Only include words of three or more characters
+Only include words that contain alphabetical characters, apostrophes and hyphens
+
+INSERT OVERWRITE TABLE normalized
+SELECT lower(gram), year, occurrences
+FROM ngrams
+WHERE year BETWEEN 1990 AND 2005
+AND gram REGEXP "^[A-Za-z+\'-]{3,}$";
+
+
+-- Display the 50 most-used words
+SELECT
+  gram,
+  sum(occurrences) as total_occurrences
+FROM normalized
+GROUP BY gram
+ORDER BY total_occurrences DESC
+LIMIT 50;
+
+
+-- Display the 50 most-used words longer than 10 characters
+SELECT
+  gram,
+  sum(occurrences) as total_occurrences
+FROM normalized
+WHERE length(gram) > 10
+GROUP BY gram
+ORDER BY total_occurrences DESC
+LIMIT 50;
+
+
+3.4 Calculate Word Usage Ratios
+A data scientist might now be interested in how word usage varies between years. The easiest way to examine this is to create a new table that contains a ratio of the relative occurrence of each word, compared to the total number of words stored for the year.
+
+CREATE TABLE ratios
+(gram string, year int, occurrences bigint, ratio double);
+
+
+--populate the ratios table with data calculated from the normalized table:
+
+INSERT OVERWRITE TABLE ratios
+SELECT
+  a.gram,
+  a.year,
+  sum(a.occurrences) AS occurrences,
+  sum(a.occurrences) / b.total AS ratio
+FROM normalized a
+JOIN (SELECT year, sum(occurrences) AS total
+      FROM normalized
+      GROUP BY year) b ON (a.year = b.year)
+GROUP BY a.gram, a.year, b.total;
+
+
+--The statement filters out all words with less than 1000 occurrences to avoid having extreme increases for very rare words.
+
+-- Words that most increased in popularity each year
+SELECT year, gram, occurrences, CONCAT(CAST(increase AS INT), 'x increase') as increase FROM
+(
+  SELECT
+    y2.gram,
+    y2.year,
+    y2.occurrences,
+    y2.ratio / y1.ratio as increase,
+    rank() OVER (PARTITION BY y2.year ORDER BY y2.ratio / y1.ratio DESC) AS rank
+  FROM ratios y2
+  JOIN ratios y1 ON y1.gram = y2.gram and y2.year = y1.year + 1
+  WHERE
+      y2.year BETWEEN 1991 and 2005
+  AND y1.occurrences > 1000
+  AND y2.occurrences > 1000
+) grams
+WHERE rank = 1
+ORDER BY year;
+
+
+-- Occurrences of 'internet' in books by year?
+SELECT
+  year,
+  occurrences
+FROM ratios
+WHERE gram = 'internet'
+ORDER BY year;
+
+-- Most popular words of each length
+SELECT DISTINCT length, gram
+FROM
+(
+  SELECT length(gram) AS length,
+  gram,
+  rank() OVER (partition by length(gram) order by occurrences desc) AS rank
+  FROM ratios
+) x
+WHERE rank = 1
+ORDER BY length;
+
+
+Created an Amazon EMR cluster running Hive
+Used Hive statements to create tables from Google Ngram input data stored in Amazon S3
+Ran Hive queries to drill-down and analyze data
